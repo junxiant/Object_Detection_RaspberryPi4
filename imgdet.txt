@@ -1,0 +1,413 @@
+import time
+import threading
+import os
+
+import glob
+
+import argparse
+import numpy as np
+import sys
+from threading import Thread
+import importlib.util
+
+# Import functions from other classes in other files
+from bluetooth import *
+from config import *
+from android import *
+from pc import *
+from stm import *
+import sys
+sys.path.append('/home/pi/detect/detect-env/lib/python3.7/site-packages/cv2')
+sys.path.insert(0, '/home/pi/detect/rpi_connection')
+sys.path.append('/home/pi/detect/rpi_connection')
+
+from camtopc import *
+from relabel import *
+
+import cv2
+
+# Main class function using threads
+class RaspberryPi(threading.Thread):
+
+    def __init__(self):
+
+        # Instantiate all classes
+        self.androidThread = AndroidInterface()
+        self.stmThread = STMInterface()
+        self.pcThread = PCinterface()
+
+
+        # Initialise connections to all interfaces
+        self.androidThread.androidConnection(UUID)
+        self.stmThread.stmConnection()
+        self.pcThread.pcConnection()
+
+        # Delay for buffer set
+        time.sleep(1)
+
+        print("Beginning Transmission...")
+
+    # Function to read from Android via Bluetooth
+    def read_Android(self):
+        while True:
+            androidMsg = self.androidThread.readFromAndroid()
+            androidMsg = str(androidMsg)
+
+            # Split the string using delimiter ":"
+            # Using first index as header to differentiate user input for interface
+            msgFromBT = androidMsg.split(":")
+            header = (msgFromBT[0])
+            print(header)
+
+            # If Android Connection is Established and Message is present
+            if self.androidThread.checkConnection() and androidMsg != "None":
+                # Sending Message from Android to STM
+                if header == 'STM':
+                    self.write_STM(msgFromBT[1]) 
+                # Sending from Android to PC
+                elif header == 'PC':
+                    self.write_PC(msgFromBT[1])
+                # Sending from Android to RPI
+                elif header == 'RPI':
+                    print("Sent to RPI")
+                    return 1
+                else:
+                    print("(main.py) - Android - Incorrect Device Selected: %s" % (msgFromBT))
+
+    # Function to read from PC through Wifi
+    def read_PC(self):
+        while True:
+            msgPC = self.pcThread.readFromPC()
+            msgPC = str(msgPC)
+
+            # Split the string using delimiter ":"
+            # Using first index as header to differentiate user input for interface
+            msgFromPC = msgPC.split(":")
+            header = msgFromPC[0]
+
+            # If PC Connection is Established and Message is present
+            if self.pcThread.checkConnection() and msgPC:
+                # If sending from PC to Android
+                if header == 'AD':
+                    self.write_Android(msgFromPC[1])
+                # If sending from PC to STM
+                elif header == 'STM':
+                    self.write_STM(msgFromPC[1])
+                else:
+                    print("(main.py) PC - Incorrect Device Selected: %s" % (msgPC))
+                    
+    # Function to read from STM via serial connection
+    def read_STM(self):
+        while True:
+            serialMsg = self.stmThread.readFromSTM()
+
+            # Split the string using delimiter ":"
+            # Using first index as header to differentiate user input for interface
+
+            # If message is present from STM
+            if serialMsg != '':
+                print("stm msg received")
+                return 1
+            else:
+                print("(main.py) STM - Incorrect Device Selected: %s" % (serialMsg))
+
+    # Function to write to android via Bluetooth
+    def write_Android(self, msg):
+        # If Android Connection is Established and Message is present
+        if self.androidThread.checkConnection() and msg:
+            self.androidThread.writeToAndroid(msg)
+            return True
+        return False
+
+    # Function to write to PC via Wifi
+    def write_PC(self, msg):
+        # If PC Connection is Established and Message is present
+        if self.pcThread.checkConnection() and msg:
+            self.pcThread.writeToPC(msg)
+            return True
+        return False
+    
+    # Function to write to STM via serial connection
+    def write_STM(self, msg):
+        # If STM connection is Established and Message is present
+        if self.stmThread.checkConnection() and msg:
+            self.stmThread.writeToSTM(msg)
+            return True
+        return False
+
+    # Function to write Image to PC via Wifi
+    def write_ImgPC(self, img):
+        # If PC Connection is Established and Image is present
+        if self.pcThread.checkConnection() and img:
+            self.pcThread.sender(img)
+            return True
+        return False
+    
+
+    # Function to read and write threads for Multithreading
+    def multithread(self):
+        # PC read and write thread
+        print("Setting PC Threads")
+        readPCthread = threading.Thread(target=self.read_PC, args=(), name="read_pc_thread")
+        writePCthread = threading.Thread(target=self.write_PC, args=(), name="write_pc_thread")
+        print("PC Threads Initialized")
+
+        # Android read and write thread
+        print("Setting Android Threads")
+        readAndroidThread = threading.Thread(target=self.read_Android, args=(), name="read_android_thread")
+        writeAndroidThread = threading.Thread(target=self.write_Android, args=(), name="write_android_thread")
+        print("Android Threads Initialized")
+
+        # STM read and write thread
+        print("Setting STM Threads")
+        readSTMThread = threading.Thread(target=self.read_STM, args=(), name="read_STM_thread")
+        writeSTMThread = threading.Thread(target=self.write_STM, args=(), name="write_STM_thread")
+        print("STM Threads Initialized")
+        
+        # Set Daemon for all threads
+        print("Setting Daemons")
+        readPCthread.daemon = True
+        writePCthread.daemon = True        
+        
+        readAndroidThread.daemon = True
+        writeAndroidThread.daemon = True
+
+        readSTMThread.daemon = True
+        writeSTMThread.daemon = True
+        print("All Daemon Set")
+
+        # Start All Threads
+        print("Starting PC Thread..")
+        readPCthread.start()
+        print("Starting Android Thread..")
+        readAndroidThread.start()
+        print("Starting STM Thread..")
+        readSTMThread.start()
+
+    # Disconnect all devices
+    def disconnectAll(self):
+        try:
+            self.androidThread.androidDisconnection()
+            self.stmThread.stmDisconnection()
+            self.pcThread.pcDisconnection()
+
+        except Exception as e:
+            pass
+        
+def img_det(IM_NAME, lst, sent):
+
+    MODEL_NAME = 'model'
+    GRAPH_NAME = 'detect.tflite'
+    LABELMAP_NAME = 'labelmap.txt'
+    min_conf_threshold = float(0.715)
+
+    pkg = importlib.util.find_spec('tflite_runtime')
+    if pkg:
+        from tflite_runtime.interpreter import Interpreter
+    else:
+        from tensorflow.lite.python.interpreter import Interpreter
+
+
+    # Get path to current working directory
+    CWD_PATH = os.getcwd()
+
+    # Path to .tflite file, which contains the model that is used for object detection
+    PATH_TO_CKPT = os.path.join(CWD_PATH,MODEL_NAME,GRAPH_NAME)
+
+    # Path to label map file
+    PATH_TO_LABELS = os.path.join(CWD_PATH,MODEL_NAME,LABELMAP_NAME)
+
+    # Load the label map
+    with open(PATH_TO_LABELS, 'r') as f:
+        labels = [line.strip() for line in f.readlines()]
+
+    if labels[0] == '???':
+        del(labels[0])
+
+    interpreter = Interpreter(model_path=PATH_TO_CKPT)
+
+    interpreter.allocate_tensors()
+
+    # Get model details
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    height = input_details[0]['shape'][1]
+    width = input_details[0]['shape'][2]
+
+    floating_model = (input_details[0]['dtype'] == np.float32)
+
+    input_mean = 127.5
+    input_std = 127.5
+
+    # Loop over every image and perform detection
+
+    # Load image and resize to expected shape [1xHxWx3]
+    image = cv2.imread(IM_NAME)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    imH, imW, _ = image.shape 
+    image_resized = cv2.resize(image_rgb, (width, height))
+    input_data = np.expand_dims(image_resized, axis=0)
+
+    # Normalize pixel values if using a floating model (i.e. if model is non-quantized)
+    if floating_model:
+        input_data = (np.float32(input_data) - input_mean) / input_std
+
+    # Perform the actual detection by running the model with the image as input
+    interpreter.set_tensor(input_details[0]['index'],input_data)
+    interpreter.invoke()
+
+    # Retrieve detection results
+    boxes = interpreter.get_tensor(output_details[1]['index'])[0] # Bounding box coordinates of detected objects
+    classes = interpreter.get_tensor(output_details[3]['index'])[0] # Class index of detected objects
+    scores = interpreter.get_tensor(output_details[0]['index'])[0] # Confidence of detected objects
+
+    # Loop over all detections and draw detection box if confidence is above minimum threshold
+    for i in range(len(scores)):
+        print("akdsnsa", i)
+        if ((scores[i] > min_conf_threshold) and (scores[i] <= 1.0)):
+
+            # Get bounding box coordinates and draw box
+            # Interpreter can return coordinates that are outside of image dimensions, need to force them to be within image using max() and min()
+            ymin = int(max(1,(boxes[i][0] * imH)))
+            xmin = int(max(1,(boxes[i][1] * imW)))
+            ymax = int(min(imH,(boxes[i][2] * imH)))
+            xmax = int(min(imW,(boxes[i][3] * imW)))
+            
+            cv2.rectangle(image, (xmin,ymin), (xmax,ymax), (10, 255, 0), 2)
+            try:
+                
+                # Draw label
+                object_name = labels[int(classes[i])] # Look up object name from "labels" array using class index
+                img_id = rl(object_name)
+                label = '%s,ID:%s' % (object_name, img_id)
+                labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2) # Get font size
+                label_ymin = max(ymin, labelSize[1] + 10) # Make sure not to draw label too close to top of window
+                cv2.rectangle(image, (xmin, label_ymin-labelSize[1]-10), (xmin+labelSize[0], label_ymin+baseLine-10), (255, 255, 255), cv2.FILLED) # Draw white box to put label text in
+                cv2.putText(image, label, (xmin, label_ymin-7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2) # Draw label text
+                
+                    
+                if(object_name in lst):
+                    lstPosition = lst.index(object_name)
+                    print("Object " + str(sent+1) + ": " + object_name)
+                    print(f"Label {object_name} found!")
+                    
+                    print("Sending to PC")
+                    targetString = f"TARGET,{img_id}"
+                    rpi.write_PC(targetString)
+                    cv2.imwrite(f'/home/pi/detect/rpi_connection/images/detect/{sent}.jpg', image)
+                    print("Image saved")
+                    lst.remove(object_name)
+                    print("Removing label from list")
+                    #sent += 1
+                else:
+                    print("label not found in list, sending wrong img id anyway")
+                    cv2.imwrite(f'/home/pi/detect/rpi_connection/images/detect/{sent}.jpg', image)
+
+                    rpi.write_PC(f"TARGET,{img_id}")
+                    #sent += 1
+
+                    
+            except:
+                img_id = 1
+                errorstring = f"TARGET,{img_id}"
+                rpi.write_PC(errorstring)
+                
+            break
+        
+        else:
+            targetString = f"TARGET,0"
+            rpi.write_PC(targetString)
+            break
+
+    # All the results have been drawn on the image, now display the image
+    cv2.imshow('Object detector', image)
+    sent += 1
+    return lst, sent
+        
+
+
+if __name__ == "__main__":
+
+    # Start Main Program
+    print("Starting Program...")
+    rpi = RaspberryPi()
+    
+    ##########################change list############################
+    lst = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'Up', 'Down', 'Left', 'Right', 'Yellow_Circle']
+    cb = 5
+    #################################################################
+    
+    sent = 0
+    try:
+        print("Starting Threads")
+        rpi.multithread()
+        print("All Threads Started")
+        
+        
+        try:
+        
+            while sent < cb:
+                print("entering read while")
+                print("while 1 sent val:", sent)
+                asdfq = True
+                while asdfq == True:
+                        
+                    read_from = rpi.read_STM()
+                    time.sleep(2)
+                    asdfq = False
+                    break
+                    
+                print("rec:", read_from)
+                
+                if read_from == 1:
+
+                    videoCaptureObject = cv2.VideoCapture(0)                 
+                    result = True
+                    
+                    while(result):
+                        ret, frame = videoCaptureObject.read()
+                        cv2.imwrite(f'/home/pi/detect/rpi_connection/images/n_{sent}.jpg',frame)
+                        
+                        print(f"{sent} Image saved")
+                        result = False
+                    videoCaptureObject.release()
+                    cv2.destroyAllWindows()
+                    
+                    # img rec function
+                    lst, sent = img_det(f'/home/pi/detect/rpi_connection/images/n_{sent}.jpg', lst, sent)
+                    print("sent val:", sent)
+            
+            if(sent==cb):
+      
+                print("Stitching Images...")
+                # Stitch Image Horizontally
+                imgpath = '/home/pi/detect/rpi_connection/images/detect/'
+                myList = os.listdir(imgpath)
+                images = []
+                for imgN in myList:
+                    curImg = cv2.imread(f'{imgpath}/{imgN}')
+                    images.append(curImg)
+
+                stitcher = cv2.hconcat(images)
+                cv2.imwrite('/home/pi/detect/rpi_connection/stitched.jpg', stitcher)
+                print("Successfully Stitched Image")
+                print("Sending IMG to pc")
+                time.sleep(0.1)
+
+                sendImgToPC()
+                time.sleep(0.1)
+                
+                print("IMG sent to pc")
+                
+                    
+                               
+        except SystemExit:
+            print("2nd try error.py")
+
+        
+        while True:
+            time.sleep(0.2)
+
+    except KeyboardInterrupt:
+        print("Exiting the program")
+        rpi.disconnectAll()
